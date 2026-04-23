@@ -4,22 +4,37 @@ import queue
 import threading
 import webbrowser
 from datetime import datetime
-from tkinter import END, Menu, VERTICAL, W, StringVar, Tk, filedialog, messagebox
+from tkinter import BooleanVar, END, Menu, Text, VERTICAL, W, StringVar, Tk, filedialog, messagebox
 from tkinter import ttk
 
 from . import __version__
 from .api import BilibiliApiClient, BilibiliApiError
 from .classifier import SAMPLE_CUSTOM_RULES, classify_videos, move_video_to_group
 from .exporter import save_classification_result
-from .models import ClassificationResult, ClassificationRule, FavoriteFolder, VideoItem
+from .models import AuthInfo, ClassificationResult, ClassificationRule, FavoriteFolder, SyncSummary, VideoItem
+
+
+COOKIE_HELP_TEXT = """获取 Cookie 的推荐方式：
+1. 在浏览器中打开 https://www.bilibili.com 并确认已经登录目标账号。
+2. 按 F12 打开开发者工具。
+3. 切到 Network（网络）面板，刷新页面。
+4. 点击任意一个发往 bilibili.com 的请求，找到 Request Headers 里的 Cookie。
+5. 复制整段 Cookie 字符串，粘贴到本工具。
+
+最低要求：
+- Cookie 中至少需要包含 SESSDATA 与 bili_jct。
+
+安全提示：
+- Cookie 等同于登录态，请不要发给他人。
+- 推荐只在本地临时使用，需要时再粘贴。"""
 
 
 class FavoritesClassifierApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title(f"B站公开收藏夹分类工具 v{__version__}")
-        self.root.geometry("1360x780")
-        self.root.minsize(1120, 700)
+        self.root.geometry("1440x860")
+        self.root.minsize(1180, 760)
 
         self.api_client = BilibiliApiClient()
         self.status_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -29,6 +44,10 @@ class FavoritesClassifierApp:
         self.status_var = StringVar(value="请输入 Bilibili 用户 ID，然后开始分类。")
         self.summary_var = StringVar(value="尚未生成分类结果。")
         self.version_var = StringVar(value=f"版本 v{__version__}")
+        self.login_info_var = StringVar(value="未检测登录状态。")
+        self.sync_mode_var = StringVar(value="copy")
+        self.sync_privacy_var = StringVar(value="1")
+        self.include_unclassified_var = BooleanVar(value=False)
 
         self.rule_rows: list[tuple[ttk.Frame, ttk.Entry, ttk.Entry]] = []
         self.current_result: ClassificationResult | None = None
@@ -36,6 +55,7 @@ class FavoritesClassifierApp:
         self.current_videos: list[VideoItem] = []
         self.current_owner_name = ""
         self.current_mid = 0
+        self.current_auth_info: AuthInfo | None = None
         self.item_metadata: dict[str, dict[str, str]] = {}
 
         self._build_layout()
@@ -82,7 +102,7 @@ class FavoritesClassifierApp:
         rules_container = ttk.Frame(content, padding=12)
         rules_container.columnconfigure(0, weight=1)
         rules_container.rowconfigure(2, weight=1)
-        content.add(rules_container, weight=3)
+        content.add(rules_container, weight=4)
 
         ttk.Label(rules_container, text="自定义分类规则").grid(row=0, column=0, sticky=W)
         self.rule_hint_label = ttk.Label(
@@ -95,6 +115,58 @@ class FavoritesClassifierApp:
         self.rules_scroll = ttk.Frame(rules_container)
         self.rules_scroll.grid(row=2, column=0, sticky="nsew")
         self.rules_scroll.columnconfigure(0, weight=1)
+
+        auth_frame = ttk.LabelFrame(rules_container, text="账号同步到 B 站", padding=12)
+        auth_frame.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        auth_frame.columnconfigure(0, weight=1)
+        auth_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            auth_frame,
+            text="粘贴完整 Cookie 后可检测登录，并将当前分类结果复制/移动到 B 站收藏夹。",
+            foreground="#555555",
+        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 8))
+
+        self.cookie_text = Text(auth_frame, height=6, wrap="word")
+        self.cookie_text.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        cookie_button_row = ttk.Frame(auth_frame)
+        cookie_button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 8))
+        cookie_button_row.columnconfigure(4, weight=1)
+
+        self.check_login_button = ttk.Button(cookie_button_row, text="检测登录", command=self._start_login_check)
+        self.check_login_button.grid(row=0, column=0, sticky=W, padx=(0, 8))
+
+        ttk.Button(cookie_button_row, text="清空 Cookie", command=self._clear_cookie_text).grid(row=0, column=1, sticky=W, padx=(0, 8))
+        ttk.Button(cookie_button_row, text="获取说明", command=self._show_cookie_help).grid(row=0, column=2, sticky=W, padx=(0, 8))
+
+        ttk.Label(cookie_button_row, textvariable=self.login_info_var, foreground="#0b6e4f").grid(
+            row=0, column=4, sticky="e"
+        )
+
+        sync_mode_frame = ttk.Frame(auth_frame)
+        sync_mode_frame.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(sync_mode_frame, text="同步方式").grid(row=0, column=0, sticky=W, padx=(0, 8))
+        ttk.Radiobutton(sync_mode_frame, text="复制到分类收藏夹", value="copy", variable=self.sync_mode_var).grid(
+            row=0, column=1, sticky=W, padx=(0, 8)
+        )
+        ttk.Radiobutton(sync_mode_frame, text="移动到分类收藏夹", value="move", variable=self.sync_mode_var).grid(
+            row=0, column=2, sticky=W
+        )
+
+        options_frame = ttk.Frame(auth_frame)
+        options_frame.grid(row=3, column=1, sticky="e", pady=(0, 8))
+        ttk.Label(options_frame, text="新建收藏夹权限").grid(row=0, column=0, sticky=W, padx=(0, 8))
+        ttk.Radiobutton(options_frame, text="私密", value="1", variable=self.sync_privacy_var).grid(row=0, column=1, sticky=W, padx=(0, 8))
+        ttk.Radiobutton(options_frame, text="公开", value="0", variable=self.sync_privacy_var).grid(row=0, column=2, sticky=W, padx=(0, 8))
+        ttk.Checkbutton(
+            options_frame,
+            text="包含未分类",
+            variable=self.include_unclassified_var,
+        ).grid(row=0, column=3, sticky=W)
+
+        self.sync_button = ttk.Button(auth_frame, text="应用分类结果到 B 站", command=self._start_sync_to_bilibili, state="disabled")
+        self.sync_button.grid(row=4, column=0, columnspan=2, sticky="ew")
 
         results_container = ttk.Frame(content, padding=12)
         results_container.columnconfigure(0, weight=1)
@@ -226,10 +298,12 @@ class FavoritesClassifierApp:
 
         self.fetch_button.configure(state="disabled")
         self.save_button.configure(state="disabled")
+        self.sync_button.configure(state="disabled")
         self.status_var.set("准备开始抓取 B 站公开收藏夹数据...")
         self.summary_var.set("正在处理中，请稍候。")
         self._clear_tree()
 
+        self._apply_cookie_from_input()
         user_mid = int(user_mid_text)
         worker = threading.Thread(
             target=self._run_classification_worker,
@@ -275,11 +349,19 @@ class FavoritesClassifierApp:
                     self.status_var.set(str(payload))
                 elif event_type == "done":
                     self._handle_finished_result(payload)
+                elif event_type == "auth_done":
+                    self._handle_auth_result(payload)
+                elif event_type == "sync_done":
+                    self._handle_sync_result(payload)
                 elif event_type == "error":
                     self.fetch_button.configure(state="normal")
-                    self.save_button.configure(state="disabled")
+                    self.check_login_button.configure(state="normal")
+                    self._refresh_sync_button_state()
+                    if self.current_result is None:
+                        self.save_button.configure(state="disabled")
                     self.status_var.set("执行失败。")
-                    self.summary_var.set("没有可用结果。")
+                    if self.current_result is None:
+                        self.summary_var.set("没有可用结果。")
                     messagebox.showerror("执行失败", str(payload))
         except queue.Empty:
             pass
@@ -297,8 +379,39 @@ class FavoritesClassifierApp:
 
         self._render_result(self.current_result)
         self._refresh_summary()
+        self._refresh_sync_button_state()
         owner_name = self.current_owner_name or f"用户 {self.current_mid}"
         self.status_var.set(f"分类完成：{owner_name}，共读取 {len(self.current_folders)} 个公开收藏夹。")
+
+    def _handle_auth_result(self, auth_info: AuthInfo) -> None:
+        self.current_auth_info = auth_info
+        self.check_login_button.configure(state="normal")
+        self.login_info_var.set(f"已登录：{auth_info.uname} (MID {auth_info.mid})")
+        self.status_var.set("登录检测完成。")
+        self._refresh_sync_button_state()
+
+    def _handle_sync_result(self, summary: SyncSummary) -> None:
+        self.fetch_button.configure(state="normal")
+        self.check_login_button.configure(state="normal")
+        self._refresh_sync_button_state()
+
+        changed_count = summary.copied_count if summary.mode == "copy" else summary.moved_count
+        action_label = "复制" if summary.mode == "copy" else "移动"
+        self.status_var.set(f"已完成同步：{action_label} {changed_count} 条视频到 B 站收藏夹。")
+
+        parts = [
+            f"同步模式：{'复制' if summary.mode == 'copy' else '移动'}",
+            f"目标用户 MID：{summary.target_mid}",
+            f"创建收藏夹：{', '.join(summary.created_folders) if summary.created_folders else '无'}",
+            f"复用收藏夹：{', '.join(summary.reused_folders) if summary.reused_folders else '无'}",
+            f"成功处理数量：{changed_count}",
+            f"跳过数量：{len(summary.skipped_videos)}",
+        ]
+        if summary.skipped_videos:
+            preview = "\n".join(summary.skipped_videos[:8])
+            parts.append(f"跳过明细（最多显示 8 条）：\n{preview}")
+
+        messagebox.showinfo("同步完成", "\n".join(parts))
 
     def _render_result(self, result: ClassificationResult) -> None:
         self._clear_tree()
@@ -450,6 +563,95 @@ class FavoritesClassifierApp:
 
         self.status_var.set(f"结果已保存到：{saved_path}")
         messagebox.showinfo("保存成功", f"分类结果已保存到：\n{saved_path}")
+
+    def _apply_cookie_from_input(self) -> None:
+        raw_cookie = self.cookie_text.get("1.0", END).strip()
+        if raw_cookie:
+            self.api_client.set_auth_cookie(raw_cookie)
+        else:
+            self.api_client.clear_auth_cookie()
+            self.current_auth_info = None
+            self.login_info_var.set("未检测登录状态。")
+
+    def _clear_cookie_text(self) -> None:
+        self.cookie_text.delete("1.0", END)
+        self.api_client.clear_auth_cookie()
+        self.current_auth_info = None
+        self.login_info_var.set("未检测登录状态。")
+        self._refresh_sync_button_state()
+
+    def _show_cookie_help(self) -> None:
+        messagebox.showinfo("Cookie 获取说明", COOKIE_HELP_TEXT)
+
+    def _start_login_check(self) -> None:
+        self._apply_cookie_from_input()
+        if not self.api_client.has_auth_cookie():
+            messagebox.showerror("缺少 Cookie", "请先粘贴完整 Cookie，再进行登录检测。")
+            return
+
+        self.check_login_button.configure(state="disabled")
+        self.status_var.set("正在检测当前 Cookie 的登录状态...")
+        worker = threading.Thread(target=self._run_login_check_worker, daemon=True)
+        worker.start()
+
+    def _run_login_check_worker(self) -> None:
+        try:
+            auth_info = self.api_client.fetch_authenticated_user()
+            self.status_queue.put(("auth_done", auth_info))
+        except Exception as exc:
+            self.status_queue.put(("error", str(exc)))
+
+    def _start_sync_to_bilibili(self) -> None:
+        if self.current_result is None:
+            messagebox.showerror("没有结果", "请先完成一次分类。")
+            return
+
+        self._apply_cookie_from_input()
+        if not self.api_client.has_auth_cookie():
+            messagebox.showerror("缺少 Cookie", "请先粘贴完整 Cookie，并检测登录后再同步。")
+            return
+
+        mode_label = "复制" if self.sync_mode_var.get() == "copy" else "移动"
+        privacy_label = "私密" if self.sync_privacy_var.get() == "1" else "公开"
+        include_unclassified = "包含" if self.include_unclassified_var.get() else "不包含"
+        confirmed = messagebox.askyesno(
+            "确认同步",
+            f"将把当前分类结果{mode_label}到 B 站收藏夹。\n\n"
+            f"目标 UID：{self.current_mid}\n"
+            f"同步方式：{mode_label}\n"
+            f"新建收藏夹权限：{privacy_label}\n"
+            f"未分类：{include_unclassified}\n\n"
+            "是否继续？",
+        )
+        if not confirmed:
+            return
+
+        self.fetch_button.configure(state="disabled")
+        self.check_login_button.configure(state="disabled")
+        self.sync_button.configure(state="disabled")
+        self.status_var.set("正在将分类结果同步到 B 站收藏夹，请稍候...")
+        worker = threading.Thread(target=self._run_sync_worker, daemon=True)
+        worker.start()
+
+    def _run_sync_worker(self) -> None:
+        try:
+            summary = self.api_client.sync_classification_result(
+                self.current_result,
+                target_user_mid=self.current_mid,
+                include_unclassified=self.include_unclassified_var.get(),
+                sync_mode=self.sync_mode_var.get(),
+                privacy=int(self.sync_privacy_var.get()),
+                progress_callback=lambda text: self.status_queue.put(("status", text)),
+            )
+            self.status_queue.put(("sync_done", summary))
+        except Exception as exc:
+            self.status_queue.put(("error", str(exc)))
+
+    def _refresh_sync_button_state(self) -> None:
+        if self.current_result is None:
+            self.sync_button.configure(state="disabled")
+        else:
+            self.sync_button.configure(state="normal")
 
 
 def run_app() -> None:
