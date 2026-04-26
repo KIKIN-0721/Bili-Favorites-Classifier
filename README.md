@@ -21,9 +21,7 @@
 
 ## 运行方式
 
-```bash
-python app.py
-```
+运行`run.bat`
 
 ## 打包为 exe
 
