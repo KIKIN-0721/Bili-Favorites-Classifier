@@ -4,8 +4,11 @@ import queue
 import threading
 import webbrowser
 from datetime import datetime
-from tkinter import BooleanVar, END, Menu, Text, VERTICAL, W, StringVar, Tk, filedialog, messagebox
-from tkinter import ttk
+from tkinter import BooleanVar, END, Menu, StringVar, Text, filedialog, messagebox
+
+import ttkbootstrap as tb
+from ttkbootstrap.scrolled import ScrolledFrame
+from ttkbootstrap.constants import BOTH
 
 from . import __version__
 from .api import BilibiliApiClient, BilibiliApiError
@@ -30,12 +33,14 @@ COOKIE_HELP_TEXT = """获取 Cookie 的推荐方式：
 
 
 class FavoritesClassifierApp:
-    def __init__(self, root: Tk) -> None:
+    def __init__(self, root: tb.Window) -> None:
         self.root = root
         self.root.title(f"B站公开收藏夹分类工具 v{__version__}")
-        self.root.geometry("1440x860")
-        self.root.minsize(1180, 760)
+        self.root.geometry("1520x920")
+        self.root.minsize(1240, 780)
+        self.root.configure(padx=0, pady=0)
 
+        self.style = tb.Style()
         self.api_client = BilibiliApiClient()
         self.status_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
@@ -43,13 +48,16 @@ class FavoritesClassifierApp:
         self.user_mid_var = StringVar()
         self.status_var = StringVar(value="请输入 Bilibili 用户 ID，然后开始分类。")
         self.summary_var = StringVar(value="尚未生成分类结果。")
-        self.version_var = StringVar(value=f"版本 v{__version__}")
-        self.login_info_var = StringVar(value="未检测登录状态。")
+        self.version_var = StringVar(value=f"Version {__version__}")
+        self.login_info_var = StringVar(value="未检测登录状态")
         self.sync_mode_var = StringVar(value="copy")
         self.sync_privacy_var = StringVar(value="1")
         self.include_unclassified_var = BooleanVar(value=False)
+        self.metric_videos_var = StringVar(value="0")
+        self.metric_groups_var = StringVar(value="0")
+        self.metric_unclassified_var = StringVar(value="0")
 
-        self.rule_rows: list[tuple[ttk.Frame, ttk.Entry, ttk.Entry]] = []
+        self.rule_rows: list[tuple[tb.Frame, tb.Entry, tb.Entry]] = []
         self.current_result: ClassificationResult | None = None
         self.current_folders: list[FavoriteFolder] = []
         self.current_videos: list[VideoItem] = []
@@ -58,135 +66,244 @@ class FavoritesClassifierApp:
         self.current_auth_info: AuthInfo | None = None
         self.item_metadata: dict[str, dict[str, str]] = {}
 
+        self._build_styles()
         self._build_layout()
         self._set_sample_rules()
         self._poll_status_queue()
 
+    def _build_styles(self) -> None:
+        colors = self.style.colors
+        self.style.configure("Hero.TFrame", background="#0F172A")
+        self.style.configure("HeroTitle.TLabel", background="#0F172A", foreground="#F8FAFC", font=("Segoe UI Semibold", 22))
+        self.style.configure("HeroBody.TLabel", background="#0F172A", foreground="#CBD5E1", font=("Segoe UI", 10))
+        self.style.configure("HeroBadge.TLabel", background="#1D4ED8", foreground="#F8FAFC", font=("Segoe UI Semibold", 9), padding=(10, 5))
+        self.style.configure("AppCard.TFrame", background=colors.bg, relief="flat")
+        self.style.configure("MetricCard.TFrame", background="#F8FAFC", relief="solid", borderwidth=1)
+        self.style.configure("MetricTitle.TLabel", background="#F8FAFC", foreground="#64748B", font=("Segoe UI", 10))
+        self.style.configure("MetricValue.TLabel", background="#F8FAFC", foreground="#0F172A", font=("Segoe UI Semibold", 22))
+        self.style.configure("PanelTitle.TLabel", foreground="#0F172A", font=("Segoe UI Semibold", 13))
+        self.style.configure("PanelHint.TLabel", foreground="#64748B", font=("Segoe UI", 9))
+        self.style.configure("App.Treeview", rowheight=34, font=("Segoe UI", 10))
+        self.style.configure("App.Treeview.Heading", font=("Segoe UI Semibold", 10))
+
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
-        top_frame = ttk.Frame(self.root, padding=12)
-        top_frame.grid(row=0, column=0, sticky="ew")
-        top_frame.columnconfigure(12, weight=1)
+        hero = tb.Frame(self.root, style="Hero.TFrame", padding=(24, 22))
+        hero.grid(row=0, column=0, sticky="nsew")
+        hero.columnconfigure(0, weight=1)
+        hero.columnconfigure(1, weight=0)
 
-        ttk.Label(top_frame, text="Bilibili 用户 ID").grid(row=0, column=0, sticky=W, padx=(0, 8))
-        self.user_mid_entry = ttk.Entry(top_frame, width=20, textvariable=self.user_mid_var)
-        self.user_mid_entry.grid(row=0, column=1, sticky=W, padx=(0, 12))
+        title_box = tb.Frame(hero, style="Hero.TFrame")
+        title_box.grid(row=0, column=0, sticky="w")
+        tb.Label(title_box, text="B站收藏夹分类与同步工作台", style="HeroTitle.TLabel").pack(anchor="w")
+        tb.Label(
+            title_box,
+            text="抓取公开收藏夹、按分区或自定义规则分类，并把结果同步回你的 B 站账号。",
+            style="HeroBody.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
-        ttk.Radiobutton(top_frame, text="默认分类", value="default", variable=self.mode_var, command=self._update_rule_state).grid(
-            row=0, column=2, sticky=W, padx=(0, 8)
+        hero_badges = tb.Frame(hero, style="Hero.TFrame")
+        hero_badges.grid(row=0, column=1, sticky="e")
+        tb.Label(hero_badges, text=self.version_var.get(), style="HeroBadge.TLabel").pack(anchor="e", pady=(0, 8))
+        self.hero_status_label = tb.Label(hero_badges, textvariable=self.login_info_var, style="HeroBody.TLabel")
+        self.hero_status_label.pack(anchor="e")
+
+        toolbar = tb.Frame(self.root, padding=(20, 16), bootstyle="light")
+        toolbar.grid(row=1, column=0, sticky="ew", padx=16, pady=(16, 12))
+        toolbar.columnconfigure(10, weight=1)
+
+        tb.Label(toolbar, text="Bilibili UID", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.user_mid_entry = tb.Entry(toolbar, width=18, textvariable=self.user_mid_var)
+        self.user_mid_entry.grid(row=0, column=1, sticky="w", padx=(0, 14))
+
+        self.default_mode_radio = tb.Radiobutton(
+            toolbar,
+            text="默认分区分类",
+            variable=self.mode_var,
+            value="default",
+            command=self._update_rule_state,
+            bootstyle="primary-toolbutton",
         )
-        ttk.Radiobutton(top_frame, text="自定义分类", value="custom", variable=self.mode_var, command=self._update_rule_state).grid(
-            row=0, column=3, sticky=W, padx=(0, 16)
+        self.default_mode_radio.grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+        self.custom_mode_radio = tb.Radiobutton(
+            toolbar,
+            text="自定义标签分类",
+            variable=self.mode_var,
+            value="custom",
+            command=self._update_rule_state,
+            bootstyle="primary-toolbutton",
         )
+        self.custom_mode_radio.grid(row=0, column=3, sticky="w", padx=(0, 14))
 
-        self.fetch_button = ttk.Button(top_frame, text="抓取并分类", command=self._start_classification)
-        self.fetch_button.grid(row=0, column=4, sticky=W, padx=(0, 8))
+        self.fetch_button = tb.Button(toolbar, text="抓取并分类", command=self._start_classification, bootstyle="primary")
+        self.fetch_button.grid(row=0, column=4, sticky="w", padx=(0, 8))
 
-        self.save_button = ttk.Button(top_frame, text="保存结果", command=self._save_result, state="disabled")
-        self.save_button.grid(row=0, column=5, sticky=W, padx=(0, 8))
+        self.save_button = tb.Button(toolbar, text="保存结果", command=self._save_result, state="disabled", bootstyle="secondary")
+        self.save_button.grid(row=0, column=5, sticky="w", padx=(0, 8))
 
-        self.sample_button = ttk.Button(top_frame, text="填入示例规则", command=self._set_sample_rules)
-        self.sample_button.grid(row=0, column=6, sticky=W, padx=(0, 8))
+        self.sample_button = tb.Button(toolbar, text="填入示例规则", command=self._set_sample_rules, bootstyle="info")
+        self.sample_button.grid(row=0, column=6, sticky="w", padx=(0, 8))
 
-        self.add_rule_button = ttk.Button(top_frame, text="新增分类", command=self._add_rule_row)
-        self.add_rule_button.grid(row=0, column=7, sticky=W, padx=(0, 8))
+        self.add_rule_button = tb.Button(toolbar, text="新增分类", command=self._add_rule_row, bootstyle="success")
+        self.add_rule_button.grid(row=0, column=7, sticky="w", padx=(0, 8))
 
-        self.remove_rule_button = ttk.Button(top_frame, text="删除末行", command=self._remove_rule_row)
-        self.remove_rule_button.grid(row=0, column=8, sticky=W, padx=(0, 8))
+        self.remove_rule_button = tb.Button(toolbar, text="删除末行", command=self._remove_rule_row, bootstyle="danger-outline")
+        self.remove_rule_button.grid(row=0, column=8, sticky="w")
 
-        content = ttk.Panedwindow(self.root, orient="horizontal")
-        content.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        content = tb.Panedwindow(self.root, orient="horizontal")
+        content.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 12))
 
-        rules_container = ttk.Frame(content, padding=12)
-        rules_container.columnconfigure(0, weight=1)
-        rules_container.rowconfigure(2, weight=1)
-        content.add(rules_container, weight=4)
+        left_panel = tb.Frame(content, padding=0)
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(0, weight=1)
+        content.add(left_panel, weight=4)
 
-        ttk.Label(rules_container, text="自定义分类规则").grid(row=0, column=0, sticky=W)
-        self.rule_hint_label = ttk.Label(
-            rules_container,
-            text="默认模式下不使用这里的规则。自定义模式下，每个类别填写一个或多个 tag 关键词；同一视频可同时进入多个类别。",
-            foreground="#555555",
-        )
-        self.rule_hint_label.grid(row=1, column=0, sticky=W, pady=(4, 12))
+        right_panel = tb.Frame(content, padding=0)
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(1, weight=1)
+        content.add(right_panel, weight=8)
 
-        self.rules_scroll = ttk.Frame(rules_container)
-        self.rules_scroll.grid(row=2, column=0, sticky="nsew")
-        self.rules_scroll.columnconfigure(0, weight=1)
+        sidebar_card = tb.Frame(left_panel, padding=16, bootstyle="light")
+        sidebar_card.grid(row=0, column=0, sticky="nsew")
+        sidebar_card.columnconfigure(0, weight=1)
+        sidebar_card.rowconfigure(1, weight=1)
 
-        auth_frame = ttk.LabelFrame(rules_container, text="账号同步到 B 站", padding=12)
-        auth_frame.grid(row=3, column=0, sticky="ew", pady=(16, 0))
-        auth_frame.columnconfigure(0, weight=1)
-        auth_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            auth_frame,
-            text="粘贴完整 Cookie 后可检测登录，并将当前分类结果复制/移动到 B 站收藏夹。",
-            foreground="#555555",
-        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 8))
-
-        self.cookie_text = Text(auth_frame, height=6, wrap="word")
-        self.cookie_text.grid(row=1, column=0, columnspan=2, sticky="ew")
-
-        cookie_button_row = ttk.Frame(auth_frame)
-        cookie_button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 8))
-        cookie_button_row.columnconfigure(4, weight=1)
-
-        self.check_login_button = ttk.Button(cookie_button_row, text="检测登录", command=self._start_login_check)
-        self.check_login_button.grid(row=0, column=0, sticky=W, padx=(0, 8))
-
-        ttk.Button(cookie_button_row, text="清空 Cookie", command=self._clear_cookie_text).grid(row=0, column=1, sticky=W, padx=(0, 8))
-        ttk.Button(cookie_button_row, text="获取说明", command=self._show_cookie_help).grid(row=0, column=2, sticky=W, padx=(0, 8))
-
-        ttk.Label(cookie_button_row, textvariable=self.login_info_var, foreground="#0b6e4f").grid(
-            row=0, column=4, sticky="e"
-        )
-
-        sync_mode_frame = ttk.Frame(auth_frame)
-        sync_mode_frame.grid(row=3, column=0, sticky="w", pady=(0, 8))
-        ttk.Label(sync_mode_frame, text="同步方式").grid(row=0, column=0, sticky=W, padx=(0, 8))
-        ttk.Radiobutton(sync_mode_frame, text="复制到分类收藏夹", value="copy", variable=self.sync_mode_var).grid(
-            row=0, column=1, sticky=W, padx=(0, 8)
-        )
-        ttk.Radiobutton(sync_mode_frame, text="移动到分类收藏夹", value="move", variable=self.sync_mode_var).grid(
-            row=0, column=2, sticky=W
+        tb.Label(sidebar_card, text="配置中心", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(sidebar_card, text="分类规则和账号同步设置分开放置，减少操作干扰。", style="PanelHint.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(4, 12)
         )
 
-        options_frame = ttk.Frame(auth_frame)
-        options_frame.grid(row=3, column=1, sticky="e", pady=(0, 8))
-        ttk.Label(options_frame, text="新建收藏夹权限").grid(row=0, column=0, sticky=W, padx=(0, 8))
-        ttk.Radiobutton(options_frame, text="私密", value="1", variable=self.sync_privacy_var).grid(row=0, column=1, sticky=W, padx=(0, 8))
-        ttk.Radiobutton(options_frame, text="公开", value="0", variable=self.sync_privacy_var).grid(row=0, column=2, sticky=W, padx=(0, 8))
-        ttk.Checkbutton(
-            options_frame,
-            text="包含未分类",
-            variable=self.include_unclassified_var,
-        ).grid(row=0, column=3, sticky=W)
+        sidebar_tabs = tb.Notebook(sidebar_card, bootstyle="primary")
+        sidebar_tabs.grid(row=2, column=0, sticky="nsew")
 
-        self.sync_button = ttk.Button(auth_frame, text="应用分类结果到 B 站", command=self._start_sync_to_bilibili, state="disabled")
-        self.sync_button.grid(row=4, column=0, columnspan=2, sticky="ew")
+        rules_tab = tb.Frame(sidebar_tabs, padding=16)
+        rules_tab.columnconfigure(0, weight=1)
+        rules_tab.rowconfigure(2, weight=1)
+        sidebar_tabs.add(rules_tab, text="分类规则")
 
-        results_container = ttk.Frame(content, padding=12)
-        results_container.columnconfigure(0, weight=1)
-        results_container.rowconfigure(2, weight=1)
-        content.add(results_container, weight=7)
+        sync_tab = tb.Frame(sidebar_tabs, padding=16)
+        sync_tab.columnconfigure(0, weight=1)
+        sidebar_tabs.add(sync_tab, text="账号同步")
 
-        ttk.Label(results_container, text="分类结果").grid(row=0, column=0, sticky=W)
-        ttk.Label(
-            results_container,
-            text="双击视频可打开网页，右键视频可移动到其他分类。",
-            foreground="#555555",
-        ).grid(row=1, column=0, sticky=W, pady=(4, 12))
+        tb.Label(rules_tab, text="自定义分类规则", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(
+            rules_tab,
+            text="每个类别填写一个或多个关键 tag。同一视频可以同时进入多个分类。",
+            style="PanelHint.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
-        tree_frame = ttk.Frame(results_container)
-        tree_frame.grid(row=2, column=0, sticky="nsew")
-        tree_frame.columnconfigure(0, weight=1)
-        tree_frame.rowconfigure(0, weight=1)
+        self.rules_container = ScrolledFrame(rules_tab, autohide=True, bootstyle="round")
+        self.rules_container.grid(row=2, column=0, sticky="nsew")
+        self.rules_content = self.rules_container
+        self._build_rule_editor_headers()
+
+        tb.Label(sync_tab, text="账号同步到 B 站", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(
+            sync_tab,
+            text="支持 Cookie 登录检测，并将当前分类结果复制或移动到 B 站收藏夹。",
+            style="PanelHint.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+
+        tb.Label(sync_tab, text="完整 Cookie", font=("Segoe UI Semibold", 10)).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        cookie_frame = tb.Frame(sync_tab, bootstyle="light")
+        cookie_frame.grid(row=3, column=0, sticky="ew")
+        cookie_frame.columnconfigure(0, weight=1)
+        self.cookie_text = Text(
+            cookie_frame,
+            height=7,
+            wrap="word",
+            relief="flat",
+            bd=0,
+            font=("Consolas", 9),
+            background="#F8FAFC",
+            foreground="#0F172A",
+            insertbackground="#0F172A",
+        )
+        self.cookie_text.grid(row=0, column=0, sticky="ew")
+
+        auth_button_row = tb.Frame(sync_tab)
+        auth_button_row.grid(row=4, column=0, sticky="ew", pady=(10, 12))
+        auth_button_row.columnconfigure(4, weight=1)
+
+        self.check_login_button = tb.Button(auth_button_row, text="检测登录", command=self._start_login_check, bootstyle="primary")
+        self.check_login_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        tb.Button(auth_button_row, text="清空 Cookie", command=self._clear_cookie_text, bootstyle="secondary").grid(
+            row=0, column=1, sticky="w", padx=(0, 8)
+        )
+        tb.Button(auth_button_row, text="获取说明", command=self._show_cookie_help, bootstyle="info-outline").grid(
+            row=0, column=2, sticky="w"
+        )
+        tb.Label(auth_button_row, textvariable=self.login_info_var, style="PanelHint.TLabel").grid(row=0, column=4, sticky="e")
+
+        sync_mode_card = tb.Frame(sync_tab, padding=14, bootstyle="light")
+        sync_mode_card.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        sync_mode_card.columnconfigure(0, weight=1)
+        sync_mode_card.columnconfigure(1, weight=1)
+
+        left_sync = tb.Frame(sync_mode_card)
+        left_sync.grid(row=0, column=0, sticky="w")
+        tb.Label(left_sync, text="同步方式", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        tb.Radiobutton(left_sync, text="复制到分类收藏夹", value="copy", variable=self.sync_mode_var, bootstyle="success-toolbutton").grid(
+            row=1, column=0, sticky="w", padx=(0, 8)
+        )
+        tb.Radiobutton(left_sync, text="移动到分类收藏夹", value="move", variable=self.sync_mode_var, bootstyle="warning-toolbutton").grid(
+            row=1, column=1, sticky="w"
+        )
+
+        right_sync = tb.Frame(sync_mode_card)
+        right_sync.grid(row=0, column=1, sticky="e")
+        tb.Label(right_sync, text="新建收藏夹权限", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        tb.Radiobutton(right_sync, text="私密", value="1", variable=self.sync_privacy_var, bootstyle="secondary-toolbutton").grid(
+            row=1, column=0, sticky="w", padx=(0, 8)
+        )
+        tb.Radiobutton(right_sync, text="公开", value="0", variable=self.sync_privacy_var, bootstyle="secondary-toolbutton").grid(
+            row=1, column=1, sticky="w", padx=(0, 8)
+        )
+        tb.Checkbutton(right_sync, text="包含未分类", variable=self.include_unclassified_var, bootstyle="round-toggle").grid(
+            row=1, column=2, sticky="w"
+        )
+
+        self.sync_button = tb.Button(
+            sync_tab,
+            text="应用分类结果到 B 站",
+            command=self._start_sync_to_bilibili,
+            state="disabled",
+            bootstyle="primary",
+        )
+        self.sync_button.grid(row=6, column=0, sticky="ew")
+
+        results_card = tb.Frame(right_panel, padding=16, bootstyle="light")
+        results_card.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        results_card.columnconfigure(0, weight=1)
+        results_card.rowconfigure(2, weight=1)
+
+        results_header = tb.Frame(results_card)
+        results_header.grid(row=0, column=0, sticky="ew")
+        results_header.columnconfigure(0, weight=1)
+        tb.Label(results_header, text="分类结果", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(
+            results_header,
+            text="双击视频打开网页，右键可移动到其他分类；同步前建议先在这里整理结果。",
+            style="PanelHint.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        metrics_row = tb.Frame(results_card)
+        metrics_row.grid(row=1, column=0, sticky="ew", pady=(14, 14))
+        metrics_row.columnconfigure((0, 1, 2), weight=1)
+        self._build_metric_card(metrics_row, 0, "视频总数", self.metric_videos_var, "primary")
+        self._build_metric_card(metrics_row, 1, "分类数量", self.metric_groups_var, "info")
+        self._build_metric_card(metrics_row, 2, "未分类", self.metric_unclassified_var, "warning")
+
+        tree_shell = tb.Frame(results_card, padding=10, bootstyle="default")
+        tree_shell.grid(row=2, column=0, sticky="nsew")
+        tree_shell.columnconfigure(0, weight=1)
+        tree_shell.rowconfigure(0, weight=1)
 
         columns = ("title", "bvid", "partition", "tags", "folders", "url")
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
+        self.tree = tb.Treeview(tree_shell, columns=columns, show="tree headings", style="App.Treeview")
         self.tree.heading("#0", text="分类")
         self.tree.heading("title", text="标题")
         self.tree.heading("bvid", text="BV号")
@@ -194,58 +311,58 @@ class FavoritesClassifierApp:
         self.tree.heading("tags", text="标签")
         self.tree.heading("folders", text="来源收藏夹")
         self.tree.heading("url", text="视频链接")
-        self.tree.column("#0", width=220, anchor="w")
-        self.tree.column("title", width=300, anchor="w")
-        self.tree.column("bvid", width=140, anchor="w")
+        self.tree.column("#0", width=240, anchor="w")
+        self.tree.column("title", width=340, anchor="w")
+        self.tree.column("bvid", width=150, anchor="w")
         self.tree.column("partition", width=150, anchor="w")
-        self.tree.column("tags", width=220, anchor="w")
-        self.tree.column("folders", width=170, anchor="w")
-        self.tree.column("url", width=250, anchor="w")
+        self.tree.column("tags", width=260, anchor="w")
+        self.tree.column("folders", width=200, anchor="w")
+        self.tree.column("url", width=260, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self._open_selected_video)
         self.tree.bind("<Button-3>", self._show_context_menu)
 
-        scrollbar = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=self.tree.yview)
+        scrollbar = tb.Scrollbar(tree_shell, orient="vertical", command=self.tree.yview, bootstyle="round")
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
-        bottom_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        bottom_frame.grid(row=2, column=0, sticky="ew")
-        bottom_frame.columnconfigure(0, weight=1)
-        bottom_frame.columnconfigure(1, weight=1)
-        bottom_frame.columnconfigure(2, weight=0)
+        footer = tb.Frame(self.root, padding=(18, 12), bootstyle="light")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        footer.columnconfigure(0, weight=1)
+        footer.columnconfigure(1, weight=1)
+        footer.columnconfigure(2, weight=0)
+        tb.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        tb.Label(footer, textvariable=self.summary_var).grid(row=0, column=1, sticky="e", padx=(12, 12))
+        tb.Label(footer, textvariable=self.version_var, style="PanelHint.TLabel").grid(row=0, column=2, sticky="e")
 
-        ttk.Label(bottom_frame, textvariable=self.status_var).grid(row=0, column=0, sticky=W)
-        ttk.Label(bottom_frame, textvariable=self.summary_var, anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 12))
-        ttk.Label(bottom_frame, textvariable=self.version_var, foreground="#666666").grid(row=0, column=2, sticky="e")
-
-        self._build_rule_editor_headers()
         self._update_rule_state()
 
-    def _build_rule_editor_headers(self) -> None:
-        for child in self.rules_scroll.winfo_children():
-            child.destroy()
+    def _build_metric_card(self, parent: tb.Frame, column: int, title: str, value_var: StringVar, accent: str) -> None:
+        card = tb.Frame(parent, padding=14, style="MetricCard.TFrame")
+        card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 8 if column < 2 else 0))
+        card.columnconfigure(0, weight=1)
+        badge = tb.Label(card, text=title, bootstyle=f"{accent}-inverse", padding=(10, 4))
+        badge.grid(row=0, column=0, sticky="w")
+        tb.Label(card, textvariable=value_var, style="MetricValue.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 4))
 
-        header_frame = ttk.Frame(self.rules_scroll)
-        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+    def _build_rule_editor_headers(self) -> None:
+        for child in self.rules_content.winfo_children():
+            child.destroy()
+        header_frame = tb.Frame(self.rules_content)
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header_frame.columnconfigure(1, weight=1)
-        ttk.Label(header_frame, text="类别名", width=14).grid(row=0, column=0, sticky=W, padx=(0, 8))
-        ttk.Label(header_frame, text="关键 tag（英文逗号分隔）").grid(row=0, column=1, sticky=W)
+        tb.Label(header_frame, text="类别名", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        tb.Label(header_frame, text="关键 tag（英文逗号分隔）", font=("Segoe UI Semibold", 10)).grid(row=0, column=1, sticky="w")
 
     def _add_rule_row(self, name: str = "", keywords: str = "") -> None:
-        if not self.rules_scroll.winfo_exists():
-            return
-        if not self.rule_rows:
-            self._build_rule_editor_headers()
-
         row_index = len(self.rule_rows) + 1
-        row_frame = ttk.Frame(self.rules_scroll)
-        row_frame.grid(row=row_index, column=0, sticky="ew", pady=4)
+        row_frame = tb.Frame(self.rules_content, padding=(0, 0, 0, 4))
+        row_frame.grid(row=row_index, column=0, sticky="ew", pady=(0, 8))
         row_frame.columnconfigure(1, weight=1)
 
-        name_entry = ttk.Entry(row_frame, width=16)
-        name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        keywords_entry = ttk.Entry(row_frame)
+        name_entry = tb.Entry(row_frame, width=16)
+        name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        keywords_entry = tb.Entry(row_frame)
         keywords_entry.grid(row=0, column=1, sticky="ew")
 
         if name:
@@ -302,6 +419,7 @@ class FavoritesClassifierApp:
         self.status_var.set("准备开始抓取 B 站公开收藏夹数据...")
         self.summary_var.set("正在处理中，请稍候。")
         self._clear_tree()
+        self._set_metric_values(0, 0, 0)
 
         self._apply_cookie_from_input()
         user_mid = int(user_mid_text)
@@ -528,10 +646,19 @@ class FavoritesClassifierApp:
     def _refresh_summary(self) -> None:
         if not self.current_result:
             self.summary_var.set("尚未生成分类结果。")
+            self._set_metric_values(0, 0, 0)
             return
-        self.summary_var.set(
-            f"视频数 {self.current_result.total_videos}，分组数 {len(self.current_result.groups)}，未分类 {self.current_result.unclassified_count}"
-        )
+
+        total_videos = self.current_result.total_videos
+        total_groups = len(self.current_result.groups)
+        unclassified = self.current_result.unclassified_count
+        self.summary_var.set(f"视频数 {total_videos}，分组数 {total_groups}，未分类 {unclassified}")
+        self._set_metric_values(total_videos, total_groups, unclassified)
+
+    def _set_metric_values(self, videos: int, groups: int, unclassified: int) -> None:
+        self.metric_videos_var.set(str(videos))
+        self.metric_groups_var.set(str(groups))
+        self.metric_unclassified_var.set(str(unclassified))
 
     def _save_result(self) -> None:
         if not self.current_result:
@@ -571,13 +698,13 @@ class FavoritesClassifierApp:
         else:
             self.api_client.clear_auth_cookie()
             self.current_auth_info = None
-            self.login_info_var.set("未检测登录状态。")
+            self.login_info_var.set("未检测登录状态")
 
     def _clear_cookie_text(self) -> None:
         self.cookie_text.delete("1.0", END)
         self.api_client.clear_auth_cookie()
         self.current_auth_info = None
-        self.login_info_var.set("未检测登录状态。")
+        self.login_info_var.set("未检测登录状态")
         self._refresh_sync_button_state()
 
     def _show_cookie_help(self) -> None:
@@ -650,15 +777,12 @@ class FavoritesClassifierApp:
     def _refresh_sync_button_state(self) -> None:
         if self.current_result is None:
             self.sync_button.configure(state="disabled")
-        else:
-            self.sync_button.configure(state="normal")
+            return
+        self.sync_button.configure(state="normal")
 
 
 def run_app() -> None:
-    root = Tk()
-    style = ttk.Style(root)
-    if "clam" in style.theme_names():
-        style.theme_use("clam")
+    root = tb.Window(themename="flatly")
     app = FavoritesClassifierApp(root)
     app.user_mid_entry.focus_set()
     root.mainloop()

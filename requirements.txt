@@ -1,1 +1,1 @@
-# No external dependencies; this project uses Python standard library only.
+ttkbootstrap>=1.20,<2.0
