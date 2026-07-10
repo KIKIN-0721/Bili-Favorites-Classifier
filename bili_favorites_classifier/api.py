@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,6 +20,7 @@ from .models import (
     VideoItem,
 )
 from .partition_map import resolve_partition_info
+from .settings import load_video_metadata_cache, save_video_metadata_cache
 
 
 ProgressCallback = Callable[[str], None]
@@ -45,17 +47,27 @@ class BilibiliApiClient:
 
     def __init__(
         self,
-        request_interval: float = 0.05,
-        tag_workers: int = 8,
+        request_interval: float = 0.5,
+        tag_workers: int = 2,
         max_retries: int = 3,
         auth_cookie: str | None = None,
+        metadata_cache_enabled: bool = True,
     ) -> None:
         self.request_interval = request_interval
         self.tag_workers = tag_workers
         self.max_retries = max_retries
         self.auth_cookie = ""
+        self.metadata_cache_enabled = metadata_cache_enabled
+        self._rate_lock = threading.Lock()
+        self._last_request_at = 0.0
         if auth_cookie:
             self.set_auth_cookie(auth_cookie)
+
+    def configure_rate_limit(self, request_interval: float | None = None, tag_workers: int | None = None) -> None:
+        if request_interval is not None:
+            self.request_interval = max(0.0, float(request_interval))
+        if tag_workers is not None:
+            self.tag_workers = max(1, min(16, int(tag_workers)))
 
     def set_auth_cookie(self, raw_cookie: str) -> None:
         normalized = "; ".join(
@@ -82,16 +94,13 @@ class BilibiliApiClient:
         data = payload.get("data") or {}
         if payload.get("code") == -101 or not data.get("isLogin"):
             raise BilibiliApiError("当前 Cookie 未登录，或缺少必要字段。请检查 SESSDATA 与 bili_jct。")
-        return AuthInfo(
-            mid=int(data.get("mid", 0) or 0),
-            uname=str(data.get("uname", "") or ""),
-            is_login=bool(data.get("isLogin")),
-        )
+        return AuthInfo(mid=int(data.get("mid", 0) or 0), uname=str(data.get("uname", "") or ""), is_login=bool(data.get("isLogin")))
 
     def fetch_user_videos(
         self,
         user_mid: int,
         progress_callback: ProgressCallback | None = None,
+        metadata_mode: str = "full",
     ) -> tuple[list[FavoriteFolder], list[VideoItem], str]:
         folders = self.fetch_public_favorite_folders(user_mid)
         if not folders:
@@ -99,6 +108,17 @@ class BilibiliApiClient:
 
         if progress_callback:
             progress_callback(f"已获取 {len(folders)} 个公开收藏夹，正在拉取视频列表...")
+
+        return self.fetch_folders_videos(folders, progress_callback=progress_callback, metadata_mode=metadata_mode)
+
+    def fetch_folders_videos(
+        self,
+        folders: list[FavoriteFolder],
+        progress_callback: ProgressCallback | None = None,
+        metadata_mode: str = "full",
+    ) -> tuple[list[FavoriteFolder], list[VideoItem], str]:
+        if not folders:
+            raise BilibiliApiError("请至少选择一个收藏夹后再开始分类。")
 
         videos_by_bvid: dict[str, VideoItem] = {}
         owner_name = ""
@@ -109,9 +129,7 @@ class BilibiliApiClient:
                 owner_name = folder_owner_name
 
             if progress_callback:
-                progress_callback(
-                    f"正在读取收藏夹 {index}/{len(folders)}：{folder.title}，发现 {len(medias)} 条视频记录"
-                )
+                progress_callback(f"正在读取收藏夹 {index}/{len(folders)}：{folder.title}，发现 {len(medias)} 条视频记录")
 
             for media in medias:
                 bvid = media.get("bvid") or media.get("bv_id")
@@ -128,6 +146,8 @@ class BilibiliApiClient:
                         owner_mid=int(media.get("upper", {}).get("mid", 0) or 0),
                         intro=(media.get("intro") or "").strip(),
                         aid=int(media.get("id", 0) or 0),
+                        partition_name=str(media.get("tname", "") or media.get("type_name", "") or ""),
+                        partition_id=int(media.get("tid", 0) or 0),
                         source_folders=[],
                     )
                     videos_by_bvid[bvid] = video
@@ -152,7 +172,7 @@ class BilibiliApiClient:
         if progress_callback:
             progress_callback(f"共整理出 {len(videos)} 个唯一视频，正在获取标签与分区信息...")
 
-        self._populate_video_metadata(videos, progress_callback=progress_callback)
+        self._populate_video_metadata(videos, metadata_mode=metadata_mode, progress_callback=progress_callback)
         return folders, sorted(videos, key=lambda item: item.title), owner_name
 
     def fetch_public_favorite_folders(self, user_mid: int) -> list[FavoriteFolder]:
@@ -170,12 +190,7 @@ class BilibiliApiClient:
             for folder in folder_list
         ]
 
-    def fetch_folder_medias(
-        self,
-        folder_id: int,
-        page_size: int = 20,
-        owner_mid: int | None = None,
-    ) -> tuple[list[dict], str]:
+    def fetch_folder_medias(self, folder_id: int, page_size: int = 20, owner_mid: int | None = None) -> tuple[list[dict], str]:
         page = 1
         medias: list[dict] = []
         owner_name = ""
@@ -222,23 +237,12 @@ class BilibiliApiClient:
         payload = self._get_json(self.VIDEO_VIEW_URL, {"bvid": bvid})
         return payload.get("data") or {}
 
-    def create_favorite_folder(
-        self,
-        title: str,
-        privacy: int = 1,
-        intro: str = "由 Bili Favorites Classifier 自动创建",
-    ) -> FavoriteFolder:
+    def create_favorite_folder(self, title: str, privacy: int = 1, intro: str = "由 Bili Favorites Classifier 自动创建") -> FavoriteFolder:
         csrf = self._get_csrf_token()
         auth_info = self.fetch_authenticated_user()
         payload = self._post_form(
             self.FAVORITE_FOLDER_ADD_URL,
-            {
-                "title": title,
-                "intro": intro,
-                "privacy": privacy,
-                "cover": "",
-                "csrf": csrf,
-            },
+            {"title": title, "intro": intro, "privacy": privacy, "cover": "", "csrf": csrf},
             referer="https://space.bilibili.com/",
             require_auth=True,
         )
@@ -246,13 +250,7 @@ class BilibiliApiClient:
         folder_id = int(data.get("id", data.get("media_id", 0)) or 0)
         if not folder_id:
             raise BilibiliApiError(f"创建收藏夹“{title}”失败，接口未返回收藏夹 ID。")
-        return FavoriteFolder(
-            folder_id=folder_id,
-            fid=int(data.get("fid", 0) or 0),
-            owner_mid=auth_info.mid,
-            title=title,
-            media_count=0,
-        )
+        return FavoriteFolder(folder_id=folder_id, fid=int(data.get("fid", 0) or 0), owner_mid=auth_info.mid, title=title, media_count=0)
 
     def sync_classification_result(
         self,
@@ -285,9 +283,7 @@ class BilibiliApiClient:
         folder_map = {folder.title: folder for folder in existing_folders}
         summary = SyncSummary(mode=sync_mode, target_mid=target_user_mid)
 
-        target_groups = [
-            group for group in result.groups if include_unclassified or group.name != "未分类"
-        ]
+        target_groups = [group for group in result.groups if include_unclassified or group.name != "未分类"]
         if not target_groups:
             raise BilibiliApiError("当前没有可同步的分类组。")
 
@@ -304,10 +300,7 @@ class BilibiliApiClient:
             if progress_callback:
                 progress_callback(f"已创建收藏夹：{group.name}")
 
-        existing_target_resource_ids = {
-            folder.folder_id: self._fetch_folder_resource_ids(folder)
-            for folder in folder_map.values()
-        }
+        existing_target_resource_ids = {folder.folder_id: self._fetch_folder_resource_ids(folder) for folder in folder_map.values()}
         action_map: dict[tuple[int, int], list[str]] = defaultdict(list)
 
         for group in target_groups:
@@ -338,19 +331,10 @@ class BilibiliApiClient:
         for (source_folder_id, target_folder_id), resources in action_map.items():
             for chunk in self._chunk_resources(resources, size=20):
                 if sync_mode == "copy":
-                    self._copy_resources(
-                        source_folder_id=source_folder_id,
-                        target_folder_id=target_folder_id,
-                        mid=auth_info.mid,
-                        resources=chunk,
-                    )
+                    self._copy_resources(source_folder_id=source_folder_id, target_folder_id=target_folder_id, mid=auth_info.mid, resources=chunk)
                     summary.copied_count += len(chunk)
                 else:
-                    self._move_resources(
-                        source_folder_id=source_folder_id,
-                        target_folder_id=target_folder_id,
-                        resources=chunk,
-                    )
+                    self._move_resources(source_folder_id=source_folder_id, target_folder_id=target_folder_id, resources=chunk)
                     summary.moved_count += len(chunk)
 
         return summary
@@ -359,68 +343,39 @@ class BilibiliApiClient:
         medias, _ = self.fetch_folder_medias(folder.folder_id, owner_mid=folder.owner_mid)
         return {int(media.get("id", 0) or 0) for media in medias}
 
-    def _copy_resources(
-        self,
-        source_folder_id: int,
-        target_folder_id: int,
-        mid: int,
-        resources: list[str],
-    ) -> None:
+    def _copy_resources(self, source_folder_id: int, target_folder_id: int, mid: int, resources: list[str]) -> None:
         csrf = self._get_csrf_token()
         self._post_form(
             self.FAVORITE_RESOURCE_COPY_URL,
-            {
-                "src_media_id": source_folder_id,
-                "tar_media_id": target_folder_id,
-                "mid": mid,
-                "resources": ",".join(resources),
-                "platform": "web",
-                "csrf": csrf,
-            },
+            {"src_media_id": source_folder_id, "tar_media_id": target_folder_id, "mid": mid, "resources": ",".join(resources), "platform": "web", "csrf": csrf},
             referer="https://space.bilibili.com/",
             require_auth=True,
         )
 
-    def _move_resources(
-        self,
-        source_folder_id: int,
-        target_folder_id: int,
-        resources: list[str],
-    ) -> None:
+    def _move_resources(self, source_folder_id: int, target_folder_id: int, resources: list[str]) -> None:
         csrf = self._get_csrf_token()
         self._post_form(
             self.FAVORITE_RESOURCE_MOVE_URL,
-            {
-                "src_media_id": source_folder_id,
-                "tar_media_id": target_folder_id,
-                "resources": ",".join(resources),
-                "platform": "web",
-                "csrf": csrf,
-            },
+            {"src_media_id": source_folder_id, "tar_media_id": target_folder_id, "resources": ",".join(resources), "platform": "web", "csrf": csrf},
             referer="https://space.bilibili.com/",
             require_auth=True,
         )
 
-    def _collect_multi_group_videos(
-        self,
-        result: ClassificationResult,
-        include_unclassified: bool,
-    ) -> list[str]:
+    def _collect_multi_group_videos(self, result: ClassificationResult, include_unclassified: bool) -> list[str]:
         ownership: dict[str, list[str]] = defaultdict(list)
         for group in result.groups:
             if not include_unclassified and group.name == "未分类":
                 continue
             for video in group.videos:
                 ownership[video.bvid].append(group.name)
-        conflicts = []
-        for bvid, group_names in ownership.items():
-            if len(group_names) > 1:
-                conflicts.append(f"{bvid} -> {', '.join(group_names)}")
-        return conflicts
+        return [f"{bvid} -> {', '.join(group_names)}" for bvid, group_names in ownership.items() if len(group_names) > 1]
 
-    def _fetch_video_metadata(self, bvid: str) -> dict[str, object]:
-        tags = self.fetch_video_tags(bvid)
-        view = self.fetch_video_view(bvid)
+    def _fetch_video_metadata(self, bvid: str, metadata_mode: str = "full") -> dict[str, object]:
+        fetch_tags = metadata_mode in {"full", "tags"}
+        fetch_view = metadata_mode in {"full", "partition"}
+
+        tags = self.fetch_video_tags(bvid) if fetch_tags else []
+        view = self.fetch_video_view(bvid) if fetch_view else {}
         partition_name, partition_id, partition_parent_name, partition_parent_id = resolve_partition_info(
             int(view.get("tid", 0) or 0),
             int(view.get("tid_v2", 0) or 0),
@@ -440,25 +395,42 @@ class BilibiliApiClient:
     def _populate_video_metadata(
         self,
         videos: list[VideoItem],
+        metadata_mode: str = "full",
         progress_callback: ProgressCallback | None = None,
     ) -> None:
+        if metadata_mode not in {"full", "tags", "partition", "none"}:
+            metadata_mode = "full"
+        if metadata_mode == "none":
+            return
+
         completed = 0
         total = len(videos)
+        metadata_cache = self._load_metadata_cache()
+        pending_videos: list[VideoItem] = []
+        cache_changed = False
+
+        for video in videos:
+            cached = metadata_cache.get(video.bvid)
+            if cached and self._cached_metadata_covers_mode(cached, metadata_mode):
+                self._apply_video_metadata(video, cached, metadata_mode=metadata_mode)
+                completed += 1
+                if progress_callback:
+                    progress_callback(f"已从缓存读取视频元数据 {completed}/{total}：{video.title}")
+                continue
+            pending_videos.append(video)
+
+        if not pending_videos:
+            return
 
         with ThreadPoolExecutor(max_workers=self.tag_workers) as executor:
-            future_map = {executor.submit(self._fetch_video_metadata, video.bvid): video for video in videos}
+            future_map = {executor.submit(self._fetch_video_metadata, video.bvid, metadata_mode): video for video in pending_videos}
             for future in as_completed(future_map):
                 video = future_map[future]
                 try:
                     metadata = future.result()
-                    video.tags = list(metadata["tags"])
-                    video.aid = int(metadata["aid"] or video.aid)
-                    if metadata["intro"] and not video.intro:
-                        video.intro = str(metadata["intro"])
-                    video.partition_name = str(metadata["partition_name"])
-                    video.partition_id = int(metadata["partition_id"])
-                    video.partition_parent_name = str(metadata["partition_parent_name"])
-                    video.partition_parent_id = int(metadata["partition_parent_id"])
+                    self._apply_video_metadata(video, metadata, metadata_mode=metadata_mode)
+                    metadata_cache[video.bvid] = self._merge_cached_metadata(metadata_cache.get(video.bvid, {}), metadata)
+                    cache_changed = True
                 except Exception:
                     video.tags = []
                     if not video.partition_name:
@@ -466,6 +438,62 @@ class BilibiliApiClient:
                 completed += 1
                 if progress_callback:
                     progress_callback(f"正在获取视频标签与分区 {completed}/{total}：{video.title}")
+                if cache_changed and completed % 50 == 0:
+                    self._save_metadata_cache(metadata_cache)
+                    cache_changed = False
+
+        if cache_changed:
+            self._save_metadata_cache(metadata_cache)
+
+    def _load_metadata_cache(self) -> dict[str, dict[str, object]]:
+        if not self.metadata_cache_enabled:
+            return {}
+        try:
+            return load_video_metadata_cache()
+        except Exception:
+            return {}
+
+    def _save_metadata_cache(self, metadata_cache: dict[str, dict[str, object]]) -> None:
+        if not self.metadata_cache_enabled:
+            return
+        try:
+            save_video_metadata_cache(metadata_cache)
+        except Exception:
+            return
+
+    def _cached_metadata_covers_mode(self, metadata: dict[str, object], metadata_mode: str) -> bool:
+        if metadata_mode == "tags":
+            return isinstance(metadata.get("tags"), list)
+        if metadata_mode == "partition":
+            return bool(metadata.get("partition_name") or metadata.get("partition_parent_name"))
+        return isinstance(metadata.get("tags"), list) and bool(metadata.get("partition_name") or metadata.get("partition_parent_name"))
+
+    def _merge_cached_metadata(self, cached: dict[str, object], metadata: dict[str, object]) -> dict[str, object]:
+        merged = dict(cached)
+        for key, value in metadata.items():
+            if value not in (None, "", [], 0):
+                merged[key] = value
+        return merged
+
+    def _apply_video_metadata(self, video: VideoItem, metadata: dict[str, object], metadata_mode: str = "full") -> None:
+        if metadata_mode in {"full", "tags"} and "tags" in metadata:
+            video.tags = list(metadata.get("tags") or [])
+        video.aid = int(metadata.get("aid") or video.aid)
+        if metadata.get("intro") and not video.intro:
+            video.intro = str(metadata["intro"])
+        if metadata_mode in {"full", "partition"}:
+            partition_name = str(metadata.get("partition_name") or "")
+            if partition_name:
+                video.partition_name = partition_name
+            partition_id = int(metadata.get("partition_id") or 0)
+            if partition_id:
+                video.partition_id = partition_id
+            partition_parent_name = str(metadata.get("partition_parent_name") or "")
+            if partition_parent_name:
+                video.partition_parent_name = partition_parent_name
+            partition_parent_id = int(metadata.get("partition_parent_id") or 0)
+            if partition_parent_id:
+                video.partition_parent_id = partition_parent_id
 
     def _get_csrf_token(self) -> str:
         csrf = self._extract_cookie_value("bili_jct")
@@ -484,37 +512,11 @@ class BilibiliApiClient:
         morsel = simple_cookie.get(cookie_name)
         return morsel.value if morsel else ""
 
-    def _get_json(
-        self,
-        base_url: str,
-        params: dict[str, object] | None = None,
-        referer: str | None = None,
-        require_auth: bool = False,
-    ) -> dict:
-        return self._request_json(
-            "GET",
-            base_url,
-            params=params,
-            referer=referer,
-            require_auth=require_auth,
-            allowed_codes={0},
-        )
+    def _get_json(self, base_url: str, params: dict[str, object] | None = None, referer: str | None = None, require_auth: bool = False) -> dict:
+        return self._request_json("GET", base_url, params=params, referer=referer, require_auth=require_auth, allowed_codes={0})
 
-    def _post_form(
-        self,
-        base_url: str,
-        form_data: dict[str, object],
-        referer: str | None = None,
-        require_auth: bool = True,
-    ) -> dict:
-        return self._request_json(
-            "POST",
-            base_url,
-            form_data=form_data,
-            referer=referer,
-            require_auth=require_auth,
-            allowed_codes={0},
-        )
+    def _post_form(self, base_url: str, form_data: dict[str, object], referer: str | None = None, require_auth: bool = True) -> dict:
+        return self._request_json("POST", base_url, form_data=form_data, referer=referer, require_auth=require_auth, allowed_codes={0})
 
     def _request_json(
         self,
@@ -538,7 +540,9 @@ class BilibiliApiClient:
             body = urllib.parse.urlencode(form_data).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
 
+        payload = {}
         for attempt in range(self.max_retries + 1):
+            self._wait_for_rate_limit()
             request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
             try:
                 with urllib.request.urlopen(request, timeout=20) as response:
@@ -546,12 +550,12 @@ class BilibiliApiClient:
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code in {412, 429} and attempt < self.max_retries:
-                    time.sleep(1.2 * (attempt + 1))
+                    self._sleep_after_throttle(attempt)
                     continue
-                if exc.code == 412:
+                if exc.code in {412, 429}:
                     raise BilibiliApiError(
-                        "Bilibili 接口触发了风控限制（HTTP 412）。这通常是接口临时反爬、访问过快，"
-                        "或当前网络环境被限制导致。请稍后重试，必要时降低请求频率或更换网络环境。"
+                        f"Bilibili 接口触发了风控限制（HTTP {exc.code}）。这通常是接口临时反爬、访问过快，"
+                        "或当前网络环境被限制导致。请稍后重试，必要时在界面中降低并发并增加请求间隔。"
                     ) from exc
                 raise BilibiliApiError(f"Bilibili HTTP 请求失败：{exc.code}") from exc
             except urllib.error.URLError as exc:
@@ -564,18 +568,25 @@ class BilibiliApiClient:
         code = payload.get("code", 0)
         if code not in allowed:
             raise BilibiliApiError(payload.get("message", f"Bilibili API request failed with code {code}."))
-
-        if self.request_interval:
-            time.sleep(self.request_interval)
         return payload
 
-    def _build_headers(
-        self,
-        base_url: str,
-        params: dict[str, object],
-        referer: str | None = None,
-        include_cookie: bool = False,
-    ) -> dict[str, str]:
+    def _wait_for_rate_limit(self) -> None:
+        interval = max(0.0, float(self.request_interval or 0.0))
+        if interval <= 0:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_seconds = self._last_request_at + interval - now
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._last_request_at = time.monotonic()
+
+    def _sleep_after_throttle(self, attempt: int) -> None:
+        self.request_interval = min(5.0, max(float(self.request_interval or 0.0), 0.5) + 0.25 * (attempt + 1))
+        base_delay = max(2.0, self.request_interval * 4)
+        time.sleep(base_delay * (attempt + 1))
+
+    def _build_headers(self, base_url: str, params: dict[str, object], referer: str | None = None, include_cookie: bool = False) -> dict[str, str]:
         resolved_referer = referer or "https://www.bilibili.com/"
         if referer is None and base_url in {self.VIDEO_TAGS_URL, self.VIDEO_VIEW_URL}:
             bvid = params.get("bvid", "")

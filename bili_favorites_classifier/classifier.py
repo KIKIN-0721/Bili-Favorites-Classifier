@@ -51,14 +51,16 @@ def _classify_with_custom_rules(
     unmatched: list[VideoItem] = []
 
     for video in videos:
-        matched_any = False
+        matched_rule_name = ""
         for rule in rules:
             if not rule.name.strip():
                 continue
             if _matching_rule_tags(video, rule):
-                groups.setdefault(rule.name, []).append(video)
-                matched_any = True
-        if not matched_any:
+                matched_rule_name = rule.name
+                break
+        if matched_rule_name:
+            groups.setdefault(matched_rule_name, []).append(video)
+        else:
             unmatched.append(video)
 
     result_groups = [
@@ -74,7 +76,6 @@ def _classify_with_custom_rules(
         )
     )
 
-    result_groups = _ordered_groups(result_groups)
     return ClassificationResult(
         mode="custom",
         groups=result_groups,

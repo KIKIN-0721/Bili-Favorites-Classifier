@@ -15,6 +15,7 @@ from .api import BilibiliApiClient, BilibiliApiError
 from .classifier import SAMPLE_CUSTOM_RULES, classify_videos, move_video_to_group
 from .exporter import save_classification_result
 from .models import AuthInfo, ClassificationResult, ClassificationRule, FavoriteFolder, SyncSummary, VideoItem
+from .settings import load_custom_rules, save_custom_rules
 
 
 COOKIE_HELP_TEXT = """获取 Cookie 的推荐方式：
@@ -56,9 +57,14 @@ class FavoritesClassifierApp:
         self.metric_videos_var = StringVar(value="0")
         self.metric_groups_var = StringVar(value="0")
         self.metric_unclassified_var = StringVar(value="0")
+        self.request_interval_var = StringVar(value=f"{self.api_client.request_interval:.2f}")
+        self.tag_workers_var = StringVar(value=str(self.api_client.tag_workers))
 
-        self.rule_rows: list[tuple[tb.Frame, tb.Entry, tb.Entry]] = []
+        self.rule_rows: list[tuple[tb.Frame, tb.Entry, tb.Entry, tb.Button, tb.Button]] = []
         self.current_result: ClassificationResult | None = None
+        self.available_folders: list[FavoriteFolder] = []
+        self.folder_selection_vars: dict[int, BooleanVar] = {}
+        self.folder_list_mid = 0
         self.current_folders: list[FavoriteFolder] = []
         self.current_videos: list[VideoItem] = []
         self.current_owner_name = ""
@@ -68,20 +74,20 @@ class FavoritesClassifierApp:
 
         self._build_styles()
         self._build_layout()
-        self._set_sample_rules()
+        self._load_saved_rules_or_samples()
         self._poll_status_queue()
 
     def _build_styles(self) -> None:
         colors = self.style.colors
-        self.style.configure("Hero.TFrame", background="#0F172A")
-        self.style.configure("HeroTitle.TLabel", background="#0F172A", foreground="#F8FAFC", font=("Segoe UI Semibold", 22))
-        self.style.configure("HeroBody.TLabel", background="#0F172A", foreground="#CBD5E1", font=("Segoe UI", 10))
-        self.style.configure("HeroBadge.TLabel", background="#1D4ED8", foreground="#F8FAFC", font=("Segoe UI Semibold", 9), padding=(10, 5))
+        self.style.configure("Hero.TFrame", background="#111827")
+        self.style.configure("HeroTitle.TLabel", background="#111827", foreground="#F9FAFB", font=("Segoe UI Semibold", 24))
+        self.style.configure("HeroBody.TLabel", background="#111827", foreground="#D1D5DB", font=("Segoe UI", 10))
+        self.style.configure("HeroBadge.TLabel", background="#2563EB", foreground="#F9FAFB", font=("Segoe UI Semibold", 9), padding=(12, 6))
         self.style.configure("AppCard.TFrame", background=colors.bg, relief="flat")
-        self.style.configure("MetricCard.TFrame", background="#F8FAFC", relief="solid", borderwidth=1)
-        self.style.configure("MetricTitle.TLabel", background="#F8FAFC", foreground="#64748B", font=("Segoe UI", 10))
-        self.style.configure("MetricValue.TLabel", background="#F8FAFC", foreground="#0F172A", font=("Segoe UI Semibold", 22))
-        self.style.configure("PanelTitle.TLabel", foreground="#0F172A", font=("Segoe UI Semibold", 13))
+        self.style.configure("MetricCard.TFrame", background="#FFFFFF", relief="solid", borderwidth=1)
+        self.style.configure("MetricTitle.TLabel", background="#FFFFFF", foreground="#64748B", font=("Segoe UI", 10))
+        self.style.configure("MetricValue.TLabel", background="#FFFFFF", foreground="#111827", font=("Segoe UI Semibold", 24))
+        self.style.configure("PanelTitle.TLabel", foreground="#111827", font=("Segoe UI Semibold", 14))
         self.style.configure("PanelHint.TLabel", foreground="#64748B", font=("Segoe UI", 9))
         self.style.configure("App.Treeview", rowheight=34, font=("Segoe UI", 10))
         self.style.configure("App.Treeview.Heading", font=("Segoe UI Semibold", 10))
@@ -138,20 +144,23 @@ class FavoritesClassifierApp:
         )
         self.custom_mode_radio.grid(row=0, column=3, sticky="w", padx=(0, 14))
 
+        self.folder_fetch_button = tb.Button(toolbar, text="获取收藏夹", command=self._start_folder_fetch, bootstyle="primary-outline")
+        self.folder_fetch_button.grid(row=0, column=4, sticky="w", padx=(0, 8))
+
         self.fetch_button = tb.Button(toolbar, text="抓取并分类", command=self._start_classification, bootstyle="primary")
-        self.fetch_button.grid(row=0, column=4, sticky="w", padx=(0, 8))
+        self.fetch_button.grid(row=0, column=5, sticky="w", padx=(0, 8))
 
         self.save_button = tb.Button(toolbar, text="保存结果", command=self._save_result, state="disabled", bootstyle="secondary")
-        self.save_button.grid(row=0, column=5, sticky="w", padx=(0, 8))
+        self.save_button.grid(row=0, column=6, sticky="w", padx=(0, 8))
 
         self.sample_button = tb.Button(toolbar, text="填入示例规则", command=self._set_sample_rules, bootstyle="info")
-        self.sample_button.grid(row=0, column=6, sticky="w", padx=(0, 8))
+        self.sample_button.grid(row=0, column=7, sticky="w", padx=(0, 8))
 
         self.add_rule_button = tb.Button(toolbar, text="新增分类", command=self._add_rule_row, bootstyle="success")
-        self.add_rule_button.grid(row=0, column=7, sticky="w", padx=(0, 8))
+        self.add_rule_button.grid(row=0, column=8, sticky="w", padx=(0, 8))
 
         self.remove_rule_button = tb.Button(toolbar, text="删除末行", command=self._remove_rule_row, bootstyle="danger-outline")
-        self.remove_rule_button.grid(row=0, column=8, sticky="w")
+        self.remove_rule_button.grid(row=0, column=9, sticky="w")
 
         content = tb.Panedwindow(self.root, orient="horizontal")
         content.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 12))
@@ -172,33 +181,57 @@ class FavoritesClassifierApp:
         sidebar_card.rowconfigure(1, weight=1)
 
         tb.Label(sidebar_card, text="配置中心", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
-        tb.Label(sidebar_card, text="分类规则和账号同步设置分开放置，减少操作干扰。", style="PanelHint.TLabel").grid(
+        tb.Label(sidebar_card, text="分类规则、请求节奏和账号同步分开放置，减少操作干扰。", style="PanelHint.TLabel").grid(
             row=1, column=0, sticky="w", pady=(4, 12)
         )
 
         sidebar_tabs = tb.Notebook(sidebar_card, bootstyle="primary")
         sidebar_tabs.grid(row=2, column=0, sticky="nsew")
 
+        folders_tab = tb.Frame(sidebar_tabs, padding=16)
+        folders_tab.columnconfigure(0, weight=1)
+        folders_tab.rowconfigure(3, weight=1)
+        sidebar_tabs.add(folders_tab, text="收藏夹选择")
+
         rules_tab = tb.Frame(sidebar_tabs, padding=16)
         rules_tab.columnconfigure(0, weight=1)
-        rules_tab.rowconfigure(2, weight=1)
+        rules_tab.rowconfigure(3, weight=1)
         sidebar_tabs.add(rules_tab, text="分类规则")
+
+        request_tab = tb.Frame(sidebar_tabs, padding=16)
+        request_tab.columnconfigure(0, weight=1)
+        sidebar_tabs.add(request_tab, text="请求节奏")
 
         sync_tab = tb.Frame(sidebar_tabs, padding=16)
         sync_tab.columnconfigure(0, weight=1)
         sidebar_tabs.add(sync_tab, text="账号同步")
 
+        self._build_folder_selector(folders_tab)
+
         tb.Label(rules_tab, text="自定义分类规则", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         tb.Label(
             rules_tab,
-            text="每个类别填写一个或多个关键 tag。同一视频可以同时进入多个分类。",
+            text="规则按自上而下顺序匹配；同一视频命中多个规则时进入第一个命中的分类。",
             style="PanelHint.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
+        rule_button_row = tb.Frame(rules_tab)
+        rule_button_row.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        rule_button_row.columnconfigure(4, weight=1)
+        self.save_rules_button = tb.Button(rule_button_row, text="保存规则", command=self._save_custom_rules, bootstyle="success-outline")
+        self.save_rules_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.load_rules_button = tb.Button(rule_button_row, text="读取规则", command=self._load_custom_rules, bootstyle="primary-outline")
+        self.load_rules_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        tb.Button(rule_button_row, text="恢复示例", command=self._set_sample_rules, bootstyle="secondary-outline").grid(
+            row=0, column=2, sticky="w"
+        )
+
         self.rules_container = ScrolledFrame(rules_tab, autohide=True, bootstyle="round")
-        self.rules_container.grid(row=2, column=0, sticky="nsew")
+        self.rules_container.grid(row=3, column=0, sticky="nsew")
         self.rules_content = self.rules_container
         self._build_rule_editor_headers()
+
+        self._build_request_settings(request_tab)
 
         tb.Label(sync_tab, text="账号同步到 B 站", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         tb.Label(
@@ -345,6 +378,108 @@ class FavoritesClassifierApp:
         badge.grid(row=0, column=0, sticky="w")
         tb.Label(card, textvariable=value_var, style="MetricValue.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 4))
 
+    def _build_folder_selector(self, parent: tb.Frame) -> None:
+        tb.Label(parent, text="收藏夹选择", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(
+            parent,
+            text="先获取公开收藏夹列表，再勾选需要抓取和分类的收藏夹。",
+            style="PanelHint.TLabel",
+            wraplength=360,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+
+        folder_button_row = tb.Frame(parent)
+        folder_button_row.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        folder_button_row.columnconfigure(3, weight=1)
+        tb.Button(folder_button_row, text="全选", command=lambda: self._set_all_folder_selections(True), bootstyle="primary-outline").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        tb.Button(folder_button_row, text="清空", command=lambda: self._set_all_folder_selections(False), bootstyle="secondary-outline").grid(
+            row=0, column=1, sticky="w"
+        )
+
+        self.folder_container = ScrolledFrame(parent, autohide=True, bootstyle="round")
+        self.folder_container.grid(row=3, column=0, sticky="nsew")
+        self.folder_content = self.folder_container
+        self._render_folder_selection([])
+
+    def _render_folder_selection(self, folders: list[FavoriteFolder]) -> None:
+        for child in self.folder_content.winfo_children():
+            child.destroy()
+        self.folder_selection_vars.clear()
+
+        if not folders:
+            tb.Label(
+                self.folder_content,
+                text="尚未获取收藏夹。请先输入 UID 并点击“获取收藏夹”。",
+                style="PanelHint.TLabel",
+                wraplength=360,
+            ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+            return
+
+        for index, folder in enumerate(folders):
+            selected_var = BooleanVar(value=True)
+            self.folder_selection_vars[folder.folder_id] = selected_var
+            label = f"{folder.title} ({folder.media_count} 个视频)"
+            tb.Checkbutton(
+                self.folder_content,
+                text=label,
+                variable=selected_var,
+                bootstyle="round-toggle",
+            ).grid(row=index, column=0, sticky="w", pady=(0, 8))
+
+    def _set_all_folder_selections(self, selected: bool) -> None:
+        for selected_var in self.folder_selection_vars.values():
+            selected_var.set(selected)
+
+    def _get_selected_folders(self) -> list[FavoriteFolder]:
+        return [
+            folder
+            for folder in self.available_folders
+            if self.folder_selection_vars.get(folder.folder_id) and self.folder_selection_vars[folder.folder_id].get()
+        ]
+
+    def _build_request_settings(self, parent: tb.Frame) -> None:
+        tb.Label(parent, text="请求速率", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        tb.Label(
+            parent,
+            text="如果出现 HTTP 412/429 或访问被阻断，可以增加间隔并降低并发；已抓过的视频会优先使用本地缓存。",
+            style="PanelHint.TLabel",
+            wraplength=360,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 16))
+
+        settings_card = tb.Frame(parent, padding=14, bootstyle="light")
+        settings_card.grid(row=2, column=0, sticky="ew")
+        settings_card.columnconfigure(1, weight=1)
+
+        tb.Label(settings_card, text="请求间隔（秒）", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+        tb.Spinbox(
+            settings_card,
+            from_=0.0,
+            to=5.0,
+            increment=0.05,
+            textvariable=self.request_interval_var,
+            width=8,
+            bootstyle="primary",
+        ).grid(row=0, column=1, sticky="w", pady=(0, 10))
+
+        tb.Label(settings_card, text="标签并发数", font=("Segoe UI Semibold", 10)).grid(row=1, column=0, sticky="w", padx=(0, 12))
+        tb.Spinbox(
+            settings_card,
+            from_=1,
+            to=8,
+            increment=1,
+            textvariable=self.tag_workers_var,
+            width=8,
+            bootstyle="primary",
+        ).grid(row=1, column=1, sticky="w")
+
+        tb.Label(
+            parent,
+            text="大收藏夹推荐从 0.50 秒、2 并发开始；如果仍被拦截，可尝试 1.00 秒、1 并发。",
+            style="PanelHint.TLabel",
+            wraplength=360,
+        ).grid(row=3, column=0, sticky="w", pady=(12, 0))
+
     def _build_rule_editor_headers(self) -> None:
         for child in self.rules_content.winfo_children():
             child.destroy()
@@ -353,6 +488,7 @@ class FavoritesClassifierApp:
         header_frame.columnconfigure(1, weight=1)
         tb.Label(header_frame, text="类别名", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", padx=(0, 10))
         tb.Label(header_frame, text="关键 tag（英文逗号分隔）", font=("Segoe UI Semibold", 10)).grid(row=0, column=1, sticky="w")
+        tb.Label(header_frame, text="顺序", font=("Segoe UI Semibold", 10)).grid(row=0, column=2, sticky="w", padx=(10, 0))
 
     def _add_rule_row(self, name: str = "", keywords: str = "") -> None:
         row_index = len(self.rule_rows) + 1
@@ -364,43 +500,163 @@ class FavoritesClassifierApp:
         name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         keywords_entry = tb.Entry(row_frame)
         keywords_entry.grid(row=0, column=1, sticky="ew")
+        up_button = tb.Button(row_frame, text="上移", width=6, command=lambda frame=row_frame: self._move_rule_row(frame, -1), bootstyle="secondary-outline")
+        up_button.grid(row=0, column=2, sticky="e", padx=(10, 4))
+        down_button = tb.Button(row_frame, text="下移", width=6, command=lambda frame=row_frame: self._move_rule_row(frame, 1), bootstyle="secondary-outline")
+        down_button.grid(row=0, column=3, sticky="e")
 
         if name:
             name_entry.insert(0, name)
         if keywords:
             keywords_entry.insert(0, keywords)
 
-        self.rule_rows.append((row_frame, name_entry, keywords_entry))
+        self.rule_rows.append((row_frame, name_entry, keywords_entry, up_button, down_button))
         self._update_rule_state()
 
     def _remove_rule_row(self) -> None:
         if len(self.rule_rows) <= 1:
             return
-        row_frame, _, _ = self.rule_rows.pop()
+        row_frame, _, _, _, _ = self.rule_rows.pop()
         row_frame.destroy()
+        self._regrid_rule_rows()
         self._update_rule_state()
 
+    def _move_rule_row(self, row_frame: tb.Frame, direction: int) -> None:
+        current_index = next((index for index, row in enumerate(self.rule_rows) if row[0] == row_frame), -1)
+        if current_index < 0:
+            return
+        target_index = current_index + direction
+        if target_index < 0 or target_index >= len(self.rule_rows):
+            return
+        self.rule_rows[current_index], self.rule_rows[target_index] = self.rule_rows[target_index], self.rule_rows[current_index]
+        self._regrid_rule_rows()
+        self._update_rule_state()
+
+    def _regrid_rule_rows(self) -> None:
+        for index, (row_frame, _, _, _, _) in enumerate(self.rule_rows, start=1):
+            row_frame.grid_configure(row=index)
+
     def _set_sample_rules(self) -> None:
-        for row_frame, _, _ in self.rule_rows:
+        self._replace_rule_rows(SAMPLE_CUSTOM_RULES)
+
+    def _replace_rule_rows(self, rules: list[ClassificationRule]) -> None:
+        for row_frame, _, _, _, _ in self.rule_rows:
             row_frame.destroy()
         self.rule_rows.clear()
         self._build_rule_editor_headers()
-        for rule in SAMPLE_CUSTOM_RULES:
+        for rule in rules:
             self._add_rule_row(rule.name, ", ".join(rule.keywords))
+        if not self.rule_rows:
+            self._add_rule_row()
         self._update_rule_state()
+
+    def _load_saved_rules_or_samples(self) -> None:
+        try:
+            rules = load_custom_rules()
+        except Exception:
+            rules = []
+        if rules:
+            self._replace_rule_rows(rules)
+            self.status_var.set("已读取上次保存的自定义分类规则。")
+        else:
+            self._set_sample_rules()
+
+    def _save_custom_rules(self) -> None:
+        rules = self._collect_custom_rules()
+        if not rules:
+            messagebox.showerror("规则错误", "至少需要填写一条完整规则后才能保存。")
+            return
+        try:
+            path = save_custom_rules(rules)
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"保存自定义规则时发生错误：{exc}")
+            return
+        self.status_var.set(f"自定义规则已保存到：{path}")
+        messagebox.showinfo("保存成功", f"自定义分类规则已保存到：\n{path}")
+
+    def _load_custom_rules(self) -> None:
+        try:
+            rules = load_custom_rules()
+        except Exception as exc:
+            messagebox.showerror("读取失败", f"读取自定义规则时发生错误：{exc}")
+            return
+        if not rules:
+            messagebox.showinfo("暂无规则", "还没有保存过自定义分类规则。")
+            return
+        self._replace_rule_rows(rules)
+        self.status_var.set("已读取保存的自定义分类规则。")
 
     def _update_rule_state(self) -> None:
         custom_enabled = self.mode_var.get() == "custom"
         entry_state = "normal" if custom_enabled else "disabled"
         button_state = "normal" if custom_enabled else "disabled"
 
-        for _, name_entry, keywords_entry in self.rule_rows:
+        for index, (_, name_entry, keywords_entry, up_button, down_button) in enumerate(self.rule_rows):
             name_entry.configure(state=entry_state)
             keywords_entry.configure(state=entry_state)
+            up_button.configure(state="normal" if custom_enabled and index > 0 else "disabled")
+            down_button.configure(state="normal" if custom_enabled and index < len(self.rule_rows) - 1 else "disabled")
 
         self.sample_button.configure(state=button_state)
         self.add_rule_button.configure(state=button_state)
         self.remove_rule_button.configure(state=button_state)
+
+    def _apply_request_settings(self) -> bool:
+        try:
+            request_interval = float(self.request_interval_var.get().strip())
+            tag_workers = int(float(self.tag_workers_var.get().strip()))
+        except ValueError:
+            messagebox.showerror("请求设置错误", "请求间隔和标签并发数必须是数字。")
+            return False
+        if request_interval < 0 or request_interval > 5:
+            messagebox.showerror("请求设置错误", "请求间隔请设置在 0 到 5 秒之间。")
+            return False
+        if tag_workers < 1 or tag_workers > 8:
+            messagebox.showerror("请求设置错误", "标签并发数请设置在 1 到 8 之间。")
+            return False
+        self.api_client.configure_rate_limit(request_interval=request_interval, tag_workers=tag_workers)
+        self.request_interval_var.set(f"{self.api_client.request_interval:.2f}")
+        self.tag_workers_var.set(str(self.api_client.tag_workers))
+        return True
+
+    def _start_folder_fetch(self) -> None:
+        user_mid_text = self.user_mid_var.get().strip()
+        if not user_mid_text.isdigit():
+            messagebox.showerror("输入错误", "请输入纯数字格式的 Bilibili 用户 ID。")
+            return
+        if not self._apply_request_settings():
+            return
+
+        self.folder_fetch_button.configure(state="disabled")
+        self.fetch_button.configure(state="disabled")
+        self.save_button.configure(state="disabled")
+        self.sync_button.configure(state="disabled")
+        self.available_folders = []
+        self.current_folders = []
+        self.current_videos = []
+        self.current_result = None
+        self.folder_list_mid = 0
+        self._render_folder_selection([])
+        self._clear_tree()
+        self._set_metric_values(0, 0, 0)
+        self.summary_var.set("正在获取收藏夹列表。")
+        self.status_var.set("正在读取 B 站公开收藏夹列表...")
+
+        self._apply_cookie_from_input()
+        user_mid = int(user_mid_text)
+        worker = threading.Thread(target=self._run_folder_fetch_worker, args=(user_mid,), daemon=True)
+        worker.start()
+
+    def _run_folder_fetch_worker(self, user_mid: int) -> None:
+        try:
+            folders = self.api_client.fetch_public_favorite_folders(user_mid)
+            if not folders:
+                raise BilibiliApiError("该用户没有公开收藏夹，或当前网络环境下无法访问公开收藏夹数据。")
+            self.status_queue.put(("folders_done", {"user_mid": user_mid, "folders": folders}))
+        except (BilibiliApiError, RuntimeError, ValueError) as exc:
+            self.status_queue.put(("error", str(exc)))
+        except Exception as exc:  # pragma: no cover
+            self.status_queue.put(("error", f"读取收藏夹列表时出现未预期错误：{exc}"))
 
     def _start_classification(self) -> None:
         user_mid_text = self.user_mid_var.get().strip()
@@ -412,20 +668,30 @@ class FavoritesClassifierApp:
         if self.mode_var.get() == "custom" and not rules:
             messagebox.showerror("规则错误", "自定义模式下至少需要填写一条完整规则。")
             return
+        if not self._apply_request_settings():
+            return
+        user_mid = int(user_mid_text)
+        if self.folder_list_mid != user_mid or not self.available_folders:
+            messagebox.showinfo("请先获取收藏夹", "请先点击“获取收藏夹”，并在“收藏夹选择”页勾选要分类的收藏夹。")
+            return
+        selected_folders = self._get_selected_folders()
+        if not selected_folders:
+            messagebox.showerror("未选择收藏夹", "请至少勾选一个收藏夹后再开始分类。")
+            return
 
+        self.folder_fetch_button.configure(state="disabled")
         self.fetch_button.configure(state="disabled")
         self.save_button.configure(state="disabled")
         self.sync_button.configure(state="disabled")
-        self.status_var.set("准备开始抓取 B 站公开收藏夹数据...")
+        self.status_var.set("准备开始抓取已选收藏夹的视频数据...")
         self.summary_var.set("正在处理中，请稍候。")
         self._clear_tree()
         self._set_metric_values(0, 0, 0)
 
         self._apply_cookie_from_input()
-        user_mid = int(user_mid_text)
         worker = threading.Thread(
             target=self._run_classification_worker,
-            args=(user_mid, self.mode_var.get(), rules),
+            args=(user_mid, self.mode_var.get(), rules, selected_folders),
             daemon=True,
         )
         worker.start()
@@ -435,11 +701,13 @@ class FavoritesClassifierApp:
         user_mid: int,
         mode: str,
         rules: list[ClassificationRule],
+        selected_folders: list[FavoriteFolder],
     ) -> None:
         try:
-            folders, videos, owner_name = self.api_client.fetch_user_videos(
-                user_mid,
+            folders, videos, owner_name = self.api_client.fetch_folders_videos(
+                selected_folders,
                 progress_callback=lambda text: self.status_queue.put(("status", text)),
+                metadata_mode=self._metadata_mode_for_classification(mode),
             )
             result = classify_videos(videos, mode=mode, custom_rules=rules)
             self.status_queue.put(
@@ -465,6 +733,8 @@ class FavoritesClassifierApp:
                 event_type, payload = self.status_queue.get_nowait()
                 if event_type == "status":
                     self.status_var.set(str(payload))
+                elif event_type == "folders_done":
+                    self._handle_folders_result(payload)
                 elif event_type == "done":
                     self._handle_finished_result(payload)
                 elif event_type == "auth_done":
@@ -472,6 +742,7 @@ class FavoritesClassifierApp:
                 elif event_type == "sync_done":
                     self._handle_sync_result(payload)
                 elif event_type == "error":
+                    self.folder_fetch_button.configure(state="normal")
                     self.fetch_button.configure(state="normal")
                     self.check_login_button.configure(state="normal")
                     self._refresh_sync_button_state()
@@ -485,7 +756,24 @@ class FavoritesClassifierApp:
             pass
         self.root.after(150, self._poll_status_queue)
 
+    def _handle_folders_result(self, payload: dict[str, object]) -> None:
+        self.folder_fetch_button.configure(state="normal")
+        self.fetch_button.configure(state="normal")
+        self.current_result = None
+        self.current_videos = []
+        self.current_folders = []
+        self.current_mid = int(payload["user_mid"])
+        self.folder_list_mid = self.current_mid
+        self.available_folders = list(payload["folders"])
+        self._render_folder_selection(self.available_folders)
+        self._refresh_sync_button_state()
+        self.save_button.configure(state="disabled")
+        total_videos = sum(folder.media_count for folder in self.available_folders)
+        self.summary_var.set(f"已获取 {len(self.available_folders)} 个公开收藏夹，约 {total_videos} 个视频。")
+        self.status_var.set("收藏夹列表获取完成，请勾选需要分类的收藏夹。")
+
     def _handle_finished_result(self, payload: dict[str, object]) -> None:
+        self.folder_fetch_button.configure(state="normal")
         self.fetch_button.configure(state="normal")
         self.save_button.configure(state="normal")
 
@@ -499,7 +787,7 @@ class FavoritesClassifierApp:
         self._refresh_summary()
         self._refresh_sync_button_state()
         owner_name = self.current_owner_name or f"用户 {self.current_mid}"
-        self.status_var.set(f"分类完成：{owner_name}，共读取 {len(self.current_folders)} 个公开收藏夹。")
+        self.status_var.set(f"分类完成：{owner_name}，共读取 {len(self.current_folders)} 个已选收藏夹。")
 
     def _handle_auth_result(self, auth_info: AuthInfo) -> None:
         self.current_auth_info = auth_info
@@ -509,6 +797,7 @@ class FavoritesClassifierApp:
         self._refresh_sync_button_state()
 
     def _handle_sync_result(self, summary: SyncSummary) -> None:
+        self.folder_fetch_button.configure(state="normal")
         self.fetch_button.configure(state="normal")
         self.check_login_button.configure(state="normal")
         self._refresh_sync_button_state()
@@ -635,13 +924,18 @@ class FavoritesClassifierApp:
 
     def _collect_custom_rules(self) -> list[ClassificationRule]:
         rules: list[ClassificationRule] = []
-        for _, name_entry, keywords_entry in self.rule_rows:
+        for _, name_entry, keywords_entry, _, _ in self.rule_rows:
             name = name_entry.get().strip()
             keywords_text = keywords_entry.get().strip()
             keywords = [keyword.strip() for keyword in keywords_text.split(",") if keyword.strip()]
             if name and keywords:
                 rules.append(ClassificationRule(name=name, keywords=keywords))
         return rules
+
+    def _metadata_mode_for_classification(self, mode: str) -> str:
+        if mode == "custom":
+            return "tags"
+        return "partition"
 
     def _refresh_summary(self) -> None:
         if not self.current_result:
@@ -711,6 +1005,8 @@ class FavoritesClassifierApp:
         messagebox.showinfo("Cookie 获取说明", COOKIE_HELP_TEXT)
 
     def _start_login_check(self) -> None:
+        if not self._apply_request_settings():
+            return
         self._apply_cookie_from_input()
         if not self.api_client.has_auth_cookie():
             messagebox.showerror("缺少 Cookie", "请先粘贴完整 Cookie，再进行登录检测。")
@@ -734,6 +1030,8 @@ class FavoritesClassifierApp:
             return
 
         self._apply_cookie_from_input()
+        if not self._apply_request_settings():
+            return
         if not self.api_client.has_auth_cookie():
             messagebox.showerror("缺少 Cookie", "请先粘贴完整 Cookie，并检测登录后再同步。")
             return

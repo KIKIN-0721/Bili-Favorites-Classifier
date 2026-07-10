@@ -97,6 +97,9 @@ class ClassificationRule:
     def normalized_keywords(self) -> list[str]:
         return [keyword.strip().lower() for keyword in self.keywords if keyword.strip()]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "keywords": self.keywords}
+
 
 @dataclass(slots=True)
 class ClassifiedGroup:
